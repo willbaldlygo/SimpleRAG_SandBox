@@ -22,34 +22,6 @@ APP_TITLE = "Digital Peninsula: ChatBot Sandbox"
 
 
 # --- Utilities ---
-def get_openai_client():
-    """Return a tuple (client_type, client_obj_or_module) based on installed SDK.
-
-    client_type: "v1" for new SDK (OpenAI class), "legacy" for old SDK, or None if unavailable.
-    """
-    try:
-        # New SDK (>=1.0)
-        from openai import OpenAI  # type: ignore
-
-        api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-        if not api_key:
-            return None, None
-        client = OpenAI(api_key=api_key)
-        return "v1", client
-    except Exception:
-        try:
-            # Legacy SDK (<1.0)
-            import openai  # type: ignore
-
-            api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-            if not api_key:
-                return None, None
-            openai.api_key = api_key
-            return "legacy", openai
-        except Exception:
-            return None, None
-
-
 def ensure_session_state():
     if "messages" not in st.session_state:
         st.session_state["messages"] = []  # list of {role, content}
@@ -61,7 +33,7 @@ def ensure_session_state():
     if "kb" not in st.session_state:
         st.session_state["kb"] = None  # dict with {text, chunks, pages, filename}
     if "model_provider" not in st.session_state:
-        st.session_state["model_provider"] = "Groq"  # Default to Groq
+        st.session_state["model_provider"] = "Cloudflare"  # Default to Cloudflare (tiny/naive model)
 
 
 def load_example_system_prompt() -> str:
@@ -195,8 +167,8 @@ def retrieve_relevant_chunks(query: str, chunks: List[str], k: int = 3) -> List[
 
 
 # --- Model calls ---
-def call_groq(messages: List[Dict[str, str]], model: str = "llama-3.1-8b-instant") -> Tuple[Optional[str], Optional[str]]:
-    """Call Groq API for fast inference with smaller models.
+def call_groq(messages: List[Dict[str, str]], model: str = "openai/gpt-oss-20b") -> Tuple[Optional[str], Optional[str]]:
+    """Call Groq API for fast inference.
 
     Returns (assistant_text, error_message). One will be None.
     Also stores raw request payload in session_state for debugging.
@@ -233,6 +205,8 @@ def call_groq(messages: List[Dict[str, str]], model: str = "llama-3.1-8b-instant
             return None, "Empty response from Groq."
         return text.strip(), None
     except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            return None, "Groq is rate-limited right now — wait a few seconds and try again."
         return None, f"Groq API error: {e} - {e.response.text if hasattr(e, 'response') else ''}"
     except requests.exceptions.Timeout:
         return None, "Groq request timed out."
@@ -240,57 +214,52 @@ def call_groq(messages: List[Dict[str, str]], model: str = "llama-3.1-8b-instant
         return None, f"Groq error: {e}"
 
 
-def call_openai(messages: List[Dict[str, str]]) -> Tuple[Optional[str], Optional[str]]:
-    """Call OpenAI Chat Completions API (gpt-3.5-turbo).
+def call_cloudflare(messages: List[Dict[str, str]], model: str = "@cf/meta/llama-3.2-1b-instruct") -> Tuple[Optional[str], Optional[str]]:
+    """Call Cloudflare Workers AI for fast inference with a tiny, unaligned model.
 
     Returns (assistant_text, error_message). One will be None.
     Also stores raw request payload in session_state for debugging.
     """
-    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-    if not api_key:
-        return None, "Missing OPENAI_API_KEY. Set it in your environment or .env."
+    api_token = os.getenv("CLOUDFLARE_API_TOKEN") or st.secrets.get("CLOUDFLARE_API_TOKEN", None)
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID") or st.secrets.get("CLOUDFLARE_ACCOUNT_ID", None)
+    if not api_token or not account_id:
+        return None, "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID. Get a free account at https://dash.cloudflare.com"
 
-    # Reasonable defaults
-    model = "gpt-3.5-turbo"
-    temperature = 0.3
-    max_tokens = 512
+    # Cloudflare Workers AI OpenAI-compatible Chat Completions endpoint
+    cloudflare_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
 
     # Prepare raw payload for display
     raw_payload = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "temperature": 0.7,
+        "max_tokens": 512,
     }
-    st.session_state["raw_request"] = {"provider": "openai", "payload": raw_payload}
+    st.session_state["raw_request"] = {"provider": "cloudflare", "payload": raw_payload, "model": model}
 
-    client_type, client = get_openai_client()
-    if client_type is None:
-        return None, "OpenAI SDK not available. Ensure 'openai' is installed."
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json"
+    }
 
     try:
-        if client_type == "v1":
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            text = resp.choices[0].message.content if resp and resp.choices else None
-        else:  # legacy
-            resp = client.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            text = resp["choices"][0]["message"]["content"] if resp and resp.get("choices") else None
+        response = requests.post(cloudflare_url, headers=headers, json=raw_payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+
+        text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 
         if not text or not text.strip():
-            return None, "Empty response from OpenAI."
+            return None, "Empty response from Cloudflare."
         return text.strip(), None
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            return None, "Cloudflare's free daily quota may be used up — try again later, or switch to the Groq model."
+        return None, f"Cloudflare API error: {e} - {e.response.text if hasattr(e, 'response') else ''}"
+    except requests.exceptions.Timeout:
+        return None, "Cloudflare request timed out."
     except Exception as e:
-        return None, f"OpenAI error: {e}"
+        return None, f"Cloudflare error: {e}"
 
 
 # --- UI ---
@@ -301,13 +270,13 @@ def sidebar():
         # Model provider selection
         st.subheader("Model Selection")
         provider = st.selectbox(
-            "Choose Provider",
-            ["Groq (Llama 3.1 8B)", "OpenAI (GPT-3.5-Turbo)"],
-            index=0 if st.session_state.get("model_provider") == "Groq" else 1
+            "Choose Model",
+            ["Cloudflare (Llama 3.2 1B)", "Groq (gpt-oss-20b)"],
+            index=0 if st.session_state.get("model_provider", "Cloudflare") == "Cloudflare" else 1
         )
         # Update session state based on selection
-        if "OpenAI" in provider:
-            st.session_state["model_provider"] = "OpenAI"
+        if "Cloudflare" in provider:
+            st.session_state["model_provider"] = "Cloudflare"
         else:
             st.session_state["model_provider"] = "Groq"
 
@@ -330,8 +299,11 @@ def sidebar():
 
         # API key / service status
         st.subheader("Service Status")
-        openai_ok = bool(os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
-        st.caption(f"OpenAI API: {'✅ set' if openai_ok else '⚠️ missing'}")
+        cloudflare_ok = bool(
+            (os.getenv("CLOUDFLARE_API_TOKEN") or st.secrets.get("CLOUDFLARE_API_TOKEN", None))
+            and (os.getenv("CLOUDFLARE_ACCOUNT_ID") or st.secrets.get("CLOUDFLARE_ACCOUNT_ID", None))
+        )
+        st.caption(f"Cloudflare API: {'✅ set' if cloudflare_ok else '⚠️ missing'}")
 
         # Check Groq API key
         groq_ok = bool(os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None))
@@ -372,30 +344,6 @@ def sidebar():
             else:
                 st.info("No knowledge base loaded.")
 
-        # Debug tools
-        with st.expander("Debug", expanded=False):
-            if st.button("Test OpenAI Connectivity"):
-                api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-                if not api_key:
-                    st.error("OPENAI_API_KEY is missing. Add it to your environment or Secrets.")
-                else:
-                    try:
-                        from openai import OpenAI  # type: ignore
-                        client = OpenAI(api_key=api_key)
-                        resp = client.chat.completions.create(
-                            model="gpt-3.5-turbo",
-                            messages=[
-                                {"role": "system", "content": "Connectivity test"},
-                                {"role": "user", "content": "Say 'hello'"},
-                            ],
-                            max_tokens=8,
-                            temperature=0.0,
-                        )
-                        st.success("OpenAI connectivity OK")
-                        st.json({"choices": [{"message": {"content": resp.choices[0].message.content}}]})
-                    except Exception as e:
-                        st.error(f"OpenAI connectivity test failed: {e}")
-
 
 def render_chat():
     # Render prior messages
@@ -427,7 +375,7 @@ def main():
         # Append user message to history
         st.session_state["messages"].append({"role": "user", "content": user_input})
 
-        # Prepare request based on selected provider
+        # Prepare request
         base_system_prompt = st.session_state["system_prompt"] or ""
 
         # RAG: build contextual system prompt using KB
@@ -448,14 +396,14 @@ def main():
         # Build API-compatible messages
         api_messages = [{"role": "system", "content": effective_system_prompt}] + st.session_state["messages"]
 
-        # Call appropriate provider
-        provider = st.session_state.get("model_provider", "OpenAI")
+        # Call the selected model
+        provider = st.session_state.get("model_provider", "Cloudflare")
         if provider == "Groq":
-            with st.spinner("Calling Groq (Llama 3.1 8B)…"):
-                assistant_text, error = call_groq(api_messages, model="llama-3.1-8b-instant")
+            with st.spinner("Calling Groq (gpt-oss-20b)…"):
+                assistant_text, error = call_groq(api_messages, model="openai/gpt-oss-20b")
         else:
-            with st.spinner("Calling OpenAI (GPT-3.5)…"):
-                assistant_text, error = call_openai(api_messages)
+            with st.spinner("Calling Cloudflare (Llama 3.2 1B)…"):
+                assistant_text, error = call_cloudflare(api_messages)
 
         # Store the error or response in session state so it persists after rerun
         if error:
